@@ -39,8 +39,8 @@ enum CompletionShell {
 // Config
 // ---------------------------------------------------------------------------
 
-/// Loaded from `$XDG_CONFIG_HOME/terris/config.toml` (or `~/.config/terris/config.toml`),
-/// falling back to `~/.terris.toml`. Missing file → all defaults.
+/// Loaded from `./.terris.toml`, falling back to `~/.terris/terris.toml`.
+/// If no config file is found, all fields use their defaults.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct Config {
