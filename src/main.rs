@@ -39,8 +39,11 @@ enum CompletionShell {
 // Config
 // ---------------------------------------------------------------------------
 
-/// Loaded from `./.terris.toml`, falling back to `~/.terris/terris.toml`.
-/// If no config file is found, all fields use their defaults.
+/// Loaded by layering:
+/// 1. `~/.terris/terris.toml` (user-global defaults)
+/// 2. `<git-root>/.terris.toml` (project-local overrides)
+///
+/// If no file is found, all fields use defaults.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct Config {
@@ -135,28 +138,54 @@ struct DisplayConfig {
 // ---------------------------------------------------------------------------
 
 fn load_config() -> Result<Config> {
-    for path in config_file_candidates()? {
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("read config '{}'", path.display()))?;
-            let config: Config = toml::from_str(&content)
-                .with_context(|| format!("parse config '{}'", path.display()))?;
-            return Ok(config);
+    let project_root = git_root().ok();
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+    for path in config_file_candidates(project_root.as_deref()) {
+        if !path.exists() {
+            continue;
         }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("read config '{}'", path.display()))?;
+        let parsed: toml::Value = toml::from_str(&content)
+            .with_context(|| format!("parse config '{}'", path.display()))?;
+        merge_toml_values(&mut merged, parsed);
     }
-    Ok(Config::default())
+    merged
+        .try_into()
+        .context("deserialize merged configuration")
 }
 
-fn config_file_candidates() -> Result<Vec<PathBuf>> {
+fn config_file_candidates(project_root: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    // 1. ./.terris.toml — project-local config; checked first so it wins over global.
-    let cwd = std::env::current_dir().context("read current directory")?;
-    candidates.push(cwd.join(".terris.toml"));
-    // 2. ~/.terris/terris.toml — user-global config; used when no local file is found.
+    // 1. ~/.terris/terris.toml — user-global defaults.
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(PathBuf::from(home).join(".terris").join("terris.toml"));
     }
-    Ok(candidates)
+    // 2. <git-root>/.terris.toml — project-local overrides.
+    if let Some(root) = project_root {
+        candidates.push(root.join(".terris.toml"));
+    } else if let Ok(cwd) = std::env::current_dir() {
+        // Best-effort fallback when not in a repository.
+        candidates.push(cwd.join(".terris.toml"));
+    }
+    candidates
+}
+
+fn merge_toml_values(dst: &mut toml::Value, src: toml::Value) {
+    match (dst, src) {
+        (toml::Value::Table(dst_table), toml::Value::Table(src_table)) => {
+            for (k, src_value) in src_table {
+                if let Some(dst_value) = dst_table.get_mut(&k) {
+                    merge_toml_values(dst_value, src_value);
+                } else {
+                    dst_table.insert(k, src_value);
+                }
+            }
+        }
+        (dst_slot, src_value) => {
+            *dst_slot = src_value;
+        }
+    }
 }
 
 /// Expand a leading `~/` or lone `~` using the `HOME` env var.
@@ -877,5 +906,35 @@ prunable stale
         let result =
             toml::from_str::<BehaviorConfig>("on_missing_branch = \"teleport\"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn merge_toml_values_layers_global_and_local() {
+        let mut merged: toml::Value =
+            toml::from_str("[display]\nshow_head = true\n").unwrap();
+        let local: toml::Value = toml::from_str(
+            "[worktrees]\nuse_random_suffix = false\n[display]\nshow_head = false\n",
+        )
+        .unwrap();
+
+        merge_toml_values(&mut merged, local);
+        let config: Config = merged.try_into().unwrap();
+        assert_eq!(config.worktrees.use_random_suffix, Some(false));
+        assert!(!config.display.show_head);
+    }
+
+    #[test]
+    fn config_file_candidates_prefers_git_root_for_local_path() {
+        let home = PathBuf::from("/tmp/fake-home");
+        let _guard = EnvGuard::set("HOME", &home);
+        let root = PathBuf::from("/tmp/repo-root");
+        let candidates = config_file_candidates(Some(&root));
+        assert_eq!(
+            candidates,
+            vec![
+                home.join(".terris").join("terris.toml"),
+                root.join(".terris.toml")
+            ]
+        );
     }
 }
