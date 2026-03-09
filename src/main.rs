@@ -80,6 +80,8 @@ impl WorktreesConfig {
 /// - `fetch`  — run `git fetch origin <branch>` and use the remote tracking ref if found
 /// - `create` — create a fresh local branch from HEAD if nothing else succeeded
 ///
+/// `error` is terminal and cannot be combined with other actions.
+///
 /// Examples:
 /// ```toml
 /// on_missing_branch = "fetch"           # fetch from remote; error if truly not found
@@ -95,11 +97,31 @@ struct BehaviorConfig {
     auto_prune: bool,
 }
 
-/// Parsed representation of `on_missing_branch`.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MissingBranchAction {
+    Error,
+    Fetch,
+    Create,
+}
+
+/// Parsed representation of `on_missing_branch` preserving action order.
+#[derive(Debug, Clone)]
 struct MissingBranchStrategy {
-    fetch: bool,
-    create: bool,
+    actions: Vec<MissingBranchAction>,
+}
+
+impl Default for MissingBranchStrategy {
+    fn default() -> Self {
+        Self {
+            actions: vec![MissingBranchAction::Error],
+        }
+    }
+}
+
+impl MissingBranchStrategy {
+    fn actions(&self) -> &[MissingBranchAction] {
+        &self.actions
+    }
 }
 
 impl<'de> Deserialize<'de> for MissingBranchStrategy {
@@ -107,21 +129,46 @@ impl<'de> Deserialize<'de> for MissingBranchStrategy {
     where
         D: serde::Deserializer<'de>,
     {
+        use std::collections::HashSet;
+
         let s = String::deserialize(deserializer)?;
-        let mut strategy = MissingBranchStrategy::default();
+        let mut actions = Vec::new();
+        let mut seen = HashSet::new();
         for part in s.split(',') {
-            match part.trim() {
-                "error" | "" => {} // explicit "error" or empty token → no-op (default)
-                "fetch" => strategy.fetch = true,
-                "create" => strategy.create = true,
+            let token = part.trim();
+            if token.is_empty() {
+                return Err(serde::de::Error::custom(
+                    "on_missing_branch cannot contain empty actions",
+                ));
+            }
+            let action = match token {
+                "error" => MissingBranchAction::Error,
+                "fetch" => MissingBranchAction::Fetch,
+                "create" => MissingBranchAction::Create,
                 other => {
                     return Err(serde::de::Error::custom(format!(
                         "unknown on_missing_branch value '{other}'; valid values: error, fetch, create"
                     )));
                 }
+            };
+            if !seen.insert(action) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate on_missing_branch action '{token}'"
+                )));
             }
+            actions.push(action);
         }
-        Ok(strategy)
+        if actions.is_empty() {
+            return Err(serde::de::Error::custom(
+                "on_missing_branch must contain at least one action",
+            ));
+        }
+        if actions.contains(&MissingBranchAction::Error) && actions.len() > 1 {
+            return Err(serde::de::Error::custom(
+                "on_missing_branch action 'error' cannot be combined with other actions",
+            ));
+        }
+        Ok(Self { actions })
     }
 }
 
@@ -294,30 +341,38 @@ fn cmd_ensure_branch(branch: &str, config: &Config) -> Result<()> {
     }
 
     let strategy = &config.behavior.on_missing_branch;
-
-    // 2. `fetch` — run `git fetch origin <branch>` and check for a remote tracking ref.
-    if strategy.fetch {
-        if git_fetch_branch(&root, branch)? {
-            create_worktree_from_remote(&root, branch, &target_path)?;
-            println!("{}", target_path.display());
-            return Ok(());
+    let mut fetch_attempted = false;
+    for action in strategy.actions() {
+        match action {
+            MissingBranchAction::Error => {
+                bail!(
+                    "branch '{}' does not exist locally. Hint: add `on_missing_branch = \"fetch, create\"` to your terris config",
+                    branch
+                );
+            }
+            MissingBranchAction::Fetch => {
+                fetch_attempted = true;
+                if git_fetch_branch(&root, branch)? {
+                    create_worktree_from_remote(&root, branch, &target_path)?;
+                    println!("{}", target_path.display());
+                    return Ok(());
+                }
+            }
+            MissingBranchAction::Create => {
+                create_worktree_new_branch(&root, branch, &target_path)?;
+                println!("{}", target_path.display());
+                return Ok(());
+            }
         }
     }
 
-    // 3. `create` — create a brand-new local branch from HEAD.
-    if strategy.create {
-        create_worktree_new_branch(&root, branch, &target_path)?;
-        println!("{}", target_path.display());
-        return Ok(());
+    if fetch_attempted {
+        bail!("branch '{}' does not exist locally and was not found on the remote", branch);
     }
-
-    bail!("branch '{}' does not exist locally{}", branch, {
-        if strategy.fetch {
-            " and was not found on the remote"
-        } else {
-            ". Hint: add `on_missing_branch = \"fetch, create\"` to your terris config"
-        }
-    });
+    bail!(
+        "branch '{}' does not exist locally. Hint: add `on_missing_branch = \"fetch, create\"` to your terris config",
+        branch
+    );
 }
 
 fn cmd_delete_branch(branch: &str) -> Result<()> {
@@ -351,15 +406,19 @@ fn git_branch_exists_local(root: &Path, branch: &str) -> Result<bool> {
 /// Runs `git fetch origin <branch>`. Returns `true` if the fetch succeeded and
 /// the remote tracking ref `refs/remotes/origin/<branch>` now exists.
 fn git_fetch_branch(root: &Path, branch: &str) -> Result<bool> {
-    let fetch_status = Command::new("git")
+    let fetch = Command::new("git")
         .args(["fetch", "origin", branch])
         .current_dir(root)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .context("run git fetch")?;
-    if !fetch_status.success() {
-        return Ok(false);
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr);
+        if is_missing_remote_ref_error(&stderr) {
+            return Ok(false);
+        }
+        bail!("git fetch origin {} failed: {}", branch, stderr.trim());
     }
     // Confirm the remote tracking ref actually landed.
     let ref_name = format!("refs/remotes/origin/{}", branch);
@@ -371,6 +430,11 @@ fn git_fetch_branch(root: &Path, branch: &str) -> Result<bool> {
         .status()
         .context("check remote tracking ref")?;
     Ok(check.success())
+}
+
+fn is_missing_remote_ref_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("couldn't find remote ref") || lower.contains("could not find remote ref")
 }
 
 /// `git worktree add --quiet <path> <branch>`  — branch must already exist locally.
@@ -878,31 +942,41 @@ prunable stale
     }
 
     #[test]
-    fn missing_branch_strategy_parse() {
-        fn parse(s: &str) -> MissingBranchStrategy {
+    fn missing_branch_strategy_parse_preserves_order() {
+        fn parse(s: &str) -> Vec<MissingBranchAction> {
             toml::from_str::<BehaviorConfig>(&format!("on_missing_branch = \"{s}\""))
                 .unwrap()
                 .on_missing_branch
+                .actions
         }
 
-        let s = parse("error");
-        assert!(!s.fetch && !s.create);
-
-        let s = parse("fetch");
-        assert!(s.fetch && !s.create);
-
-        let s = parse("create");
-        assert!(!s.fetch && s.create);
-
-        let s = parse("fetch, create");
-        assert!(s.fetch && s.create);
-
-        let s = parse("create, fetch"); // order doesn't matter for flags
-        assert!(s.fetch && s.create);
+        assert_eq!(parse("error"), vec![MissingBranchAction::Error]);
+        assert_eq!(parse("fetch"), vec![MissingBranchAction::Fetch]);
+        assert_eq!(parse("create"), vec![MissingBranchAction::Create]);
+        assert_eq!(
+            parse("fetch, create"),
+            vec![MissingBranchAction::Fetch, MissingBranchAction::Create]
+        );
+        assert_eq!(
+            parse("create, fetch"),
+            vec![MissingBranchAction::Create, MissingBranchAction::Fetch]
+        );
     }
 
     #[test]
-    fn missing_branch_strategy_rejects_unknown() {
+    fn missing_branch_strategy_rejects_invalid_combinations() {
+        let with_error =
+            toml::from_str::<BehaviorConfig>("on_missing_branch = \"error, fetch\"");
+        assert!(with_error.is_err());
+
+        let with_duplicate =
+            toml::from_str::<BehaviorConfig>("on_missing_branch = \"fetch, fetch\"");
+        assert!(with_duplicate.is_err());
+
+        let with_empty =
+            toml::from_str::<BehaviorConfig>("on_missing_branch = \"fetch, \"");
+        assert!(with_empty.is_err());
+
         let result =
             toml::from_str::<BehaviorConfig>("on_missing_branch = \"teleport\"");
         assert!(result.is_err());
