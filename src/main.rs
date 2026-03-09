@@ -71,6 +71,16 @@ impl WorktreesConfig {
     fn suffix_length(&self) -> usize {
         self.suffix_length.unwrap_or(8)
     }
+    fn validated_suffix_length(&self) -> Result<usize> {
+        let len = self.suffix_length();
+        if !(1..=64).contains(&len) {
+            bail!(
+                "invalid configuration: worktrees.suffix_length must be between 1 and 64 (got {})",
+                len
+            );
+        }
+        Ok(len)
+    }
 }
 
 /// `[behavior]` — controls what happens when the requested branch is not found locally.
@@ -197,9 +207,18 @@ fn load_config() -> Result<Config> {
             .with_context(|| format!("parse config '{}'", path.display()))?;
         merge_toml_values(&mut merged, parsed);
     }
-    merged
+    let config: Config = merged
         .try_into()
-        .context("deserialize merged configuration")
+        .context("deserialize merged configuration")?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    if config.worktrees.use_random_suffix() {
+        let _ = config.worktrees.validated_suffix_length()?;
+    }
+    Ok(())
 }
 
 fn config_file_candidates(project_root: Option<&Path>) -> Vec<PathBuf> {
@@ -475,7 +494,7 @@ fn create_worktree_new_branch(root: &Path, branch: &str, path: &Path) -> Result<
 fn default_worktree_path(repo_name: &str, branch: &str, config: &Config) -> Result<PathBuf> {
     let base = registry_base_dir(config)?;
     if config.worktrees.use_random_suffix() {
-        let suffix = random_suffix(config.worktrees.suffix_length());
+        let suffix = random_suffix(config.worktrees.validated_suffix_length()?);
         Ok(base.join(repo_name).join(format!("{}-{}", branch, suffix)))
     } else {
         Ok(base.join(repo_name).join(branch))
@@ -1010,5 +1029,19 @@ prunable stale
                 root.join(".terris.toml")
             ]
         );
+    }
+
+    #[test]
+    fn default_worktree_path_rejects_invalid_suffix_length() {
+        let config = Config {
+            worktrees: WorktreesConfig {
+                suffix_length: Some(0),
+                ..WorktreesConfig::default()
+            },
+            ..Config::default()
+        };
+        let err =
+            default_worktree_path("repo", "branch", &config).unwrap_err().to_string();
+        assert!(err.contains("worktrees.suffix_length"));
     }
 }
