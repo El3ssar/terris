@@ -789,19 +789,28 @@ fn find_worktree_by_branch<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct EnvGuard {
         key: &'static str,
         prior: Option<std::ffi::OsString>,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(key: &'static str, value: &Path) -> Self {
+            let lock = ENV_MUTEX.lock().expect("lock ENV mutex");
             let prior = std::env::var_os(key);
             unsafe {
                 std::env::set_var(key, value);
             }
-            Self { key, prior }
+            Self {
+                key,
+                prior,
+                _lock: lock,
+            }
         }
     }
 
